@@ -9,12 +9,16 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 
 // Update data classes to match Python server
 
-
 class CompilerService {
-    private val client = OkHttpClient()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .build()
     private val gson = Gson()
     private val TAG = "CompilerService"
     
@@ -31,6 +35,7 @@ class CompilerService {
         language: String = "kotlin"  // Add language parameter with default
     ): CompileResponse {
         return withContext(Dispatchers.IO) {
+            var response: Response? = null
             try {
                 val request = CompileRequest(code, language, fileName)
                 val json = gson.toJson(request)
@@ -43,44 +48,58 @@ class CompilerService {
                     .url(serverUrl)
                     .post(requestBody)
                     .addHeader("Content-Type", "application/json")
+                    .addHeader("Connection", "close") // Add this to prevent connection reuse issues
                     .build()
                 
-                val response = client.newCall(httpRequest).execute()
-                val responseBody = response.body?.string()
+                response = client.newCall(httpRequest).execute()
                 
-                Log.d(TAG, "Response code: ${response.code}")
-                Log.d(TAG, "Compile response: $responseBody")
-                
-                if (response.isSuccessful) {
-                    if (responseBody != null) {
-                        try {
-                            val result = gson.fromJson(responseBody, CompileResponse::class.java)
-                            Log.d(TAG, "Successfully parsed response: success=${result.success}, errors=${result.errors.size}")
-                            result
-                        } catch (e: JsonSyntaxException) {
-                            Log.e(TAG, "JSON parsing error. Raw response: $responseBody", e)
-                            CompileResponse(
-                                success = false,
-                                output = "JSON parsing error: ${e.message}",
-                                errors = listOf("Server returned invalid JSON: $responseBody")
-                            )
+                // Use response.use to ensure proper cleanup
+                response.use { resp ->
+                    val responseBody = resp.body?.string()
+                    
+                    Log.d(TAG, "Response code: ${resp.code}")
+                    Log.d(TAG, "Response headers: ${resp.headers}")
+                    Log.d(TAG, "Compile response: $responseBody")
+                    
+                    if (resp.isSuccessful) {
+                        if (responseBody != null && responseBody.isNotEmpty()) {
+                            try {
+                                val result = gson.fromJson(responseBody, CompileResponse::class.java)
+                                Log.d(TAG, "Successfully parsed response: success=${result.success}, errors=${result.errors.size}")
+                                result
+                            } catch (e: JsonSyntaxException) {
+                                Log.e(TAG, "JSON parsing error. Raw response: $responseBody", e)
+                                CompileResponse(
+                                    success = false,
+                                    output = "JSON parsing error: ${e.message}",
+                                    errors = listOf("Server returned invalid JSON: $responseBody")
+                                )
+                            }
+                        } else {
+                            Log.e(TAG, "Empty or null response body")
+                            CompileResponse(false, "Empty response from server", listOf("No response body"))
                         }
                     } else {
-                        CompileResponse(false, "Empty response from server", listOf("No response body"))
+                        Log.e(TAG, "HTTP error: ${resp.code}, body: $responseBody")
+                        CompileResponse(
+                            success = false,
+                            output = "HTTP Error: ${resp.code}",
+                            errors = listOf("Server error: ${resp.code} - ${responseBody ?: "No error details"}")
+                        )
                     }
-                } else {
-                    Log.e(TAG, "HTTP error: ${response.code}, body: $responseBody")
-                    CompileResponse(
-                        success = false,
-                        output = "HTTP Error: ${response.code}",
-                        errors = listOf("Server error: ${response.code} - ${responseBody ?: "No error details"}")
-                    )
                 }
             } catch (e: IOException) {
                 Log.e(TAG, "Network error", e)
+                // Add more specific error information
+                val errorMessage = when {
+                    e.message?.contains("timeout") == true -> "Request timeout - server may be busy"
+                    e.message?.contains("Connection refused") == true -> "Cannot connect to server - check if server is running"
+                    e.message?.contains("reset") == true -> "Connection was reset by server"
+                    else -> "Network error: ${e.message}"
+                }
                 CompileResponse(
                     success = false,
-                    output = "Network error: ${e.message}",
+                    output = errorMessage,
                     errors = listOf("Cannot connect to compiler server. Make sure the server is running on port 5000.")
                 )
             } catch (e: Exception) {
@@ -90,6 +109,11 @@ class CompilerService {
                     output = "Unexpected error: ${e.message}",
                     errors = listOf("Internal error: ${e.javaClass.simpleName} - ${e.message}")
                 )
+            } finally {
+                // Ensure response is closed if not already done
+                if (response != null && !response.isSuccessful) {
+                    response.close()
+                }
             }
         }
     }
